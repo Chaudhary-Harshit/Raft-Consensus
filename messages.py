@@ -1,3 +1,4 @@
+from typing import Union
 from dataclasses import dataclass
 
 
@@ -35,3 +36,12 @@ class AppendEntries:
 class AppendEntriesResponse:  # follower's reply
     term: int
     success: bool
+
+
+RaftMessage = Union[RequestVote, RequestVoteResponse, AppendEntries, AppendEntriesResponse]
+MESSAGE_TYPES = {
+    'RequestVote': RequestVote,
+    'RequestVoteResponse': RequestVoteResponse,
+    'AppendEntries': AppendEntries,
+    'AppendEntriesResponse': AppendEntriesResponse,
+    }
