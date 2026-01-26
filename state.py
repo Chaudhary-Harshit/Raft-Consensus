@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from enum import Enum
 
+from raft.messages import LogEntry
+
 
 class NodeState(Enum):
     FOLLOWER = 'follower'  # default state, recieves heartbeats from the leader
@@ -12,7 +14,7 @@ class NodeState(Enum):
 class PersistentState:
     current_term: int = 0  # latest term node has seen
     voted_for: str | None = None  # node id voted in this term
-    log: list = field(default_factory=list)  # list of log entries
+    log: list[LogEntry] = field(default_factory=list)  # list of log entries
 
 
 @dataclass
