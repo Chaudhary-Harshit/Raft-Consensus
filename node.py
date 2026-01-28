@@ -130,10 +130,60 @@ class RaftNode:
         return len(self._votes_received) > total_nodes // 2
 
     async def _become_leader(self) -> None:
-        pass
+
+        # Change the state to leader
+        self._node_state = NodeState.LEADER
+        self._leader_id = self._node_id
+
+        # Cancel election timeout task as we are now the leader
+        if self._election_timeout_task:
+            self._election_timeout_task.cancel()
+            self._election_timeout_task = None
+
+        # Initialize leader volatile state
+        last_log_index = len(self._persistent_state.log)
+        self._leader_state = LeaderVolatileState(
+            next_index={peer_id: last_log_index + 1 for peer_id in self._peers},
+            match_index={peer_id: 0 for peer_id in self._peers},
+        )
+
+        # Start Heatbeat Loop
+        self._heartbeat_interval_task = asyncio.create_task(self._heartbeat_loop())
+
+        # Send initial heartbeats to all followers
+        await self._send_heartbeats()
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodically send heartbeats to followers."""
+        while True:
+            await asyncio.sleep(self._heartbeat_interval)
+            await self._send_heartbeats()
+
+    async def _send_heartbeats(self) -> None:
+        """Send AppendEntries (heartbeats) to all the followers."""
+        async def _send_to_peer(peer_id, peer_address):
+            prev_log_index = self._leader_state.next_index[peer_id] - 1
+            prev_log_term = 0
+            if prev_log_index > 0:
+                prev_log_term = self._persistent_state.log[prev_log_index - 1].term
+            append_entries = AppendEntries(
+                term=self._persistent_state.current_term,
+                leader_id=self._node_id,
+                prev_log_index=prev_log_index,
+                prev_log_term=prev_log_term,
+                entries=[],
+                leader_commit=self._volatile_state.commit_index,
+            )
+            data = self._serializer.serialize(append_entries)
+            await self._transport.send(peer_address, data)
+        await asyncio.gather(*[
+            _send_to_peer(peer_id, peer_address)
+            for peer_id, peer_address in self._peers.items()
+        ])
 
     async def _send_request_vote(self, peer_id: str, peer_address: str) -> None:
         """Send RequestVote RPC to a peer."""
+
         last_log_index = len(self._persistent_state.log)
         last_log_term = 0
         if self._persistent_state.log:
@@ -146,4 +196,3 @@ class RaftNode:
         )
         data = self._serializer.serialize(request)
         await self._transport.send(peer_address, data)
-

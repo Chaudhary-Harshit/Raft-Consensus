@@ -26,4 +26,4 @@ class VolatileState:  # has to be rebuilt after node crash
 @dataclass
 class LeaderVolatileState:
     next_index: dict[str, int] = field(default_factory=dict)  # for each follower, index of the next log entry to send to that follower
-    match_index: dict[str, int] = field(default_factory=dict)  # for each follower, index of highest log entry that leader knows has been replicated on that follower
+    match_index: dict[str, int] = field(default_factory=dict)  # for each follower, index of highest log entry that leader knows has been replicated on that follower (default: 0)
