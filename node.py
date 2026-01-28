@@ -122,7 +122,7 @@ class RaftNode:
         await asyncio.gather(*[
             self._send_request_vote(peer_id, peer_address)
             for peer_id, peer_address in self._peers.items()
-        ])
+        ], return_exceptions=True)
 
     def _has_majority(self) -> bool:
         """Check if the node has received majority votes."""
@@ -157,7 +157,10 @@ class RaftNode:
         """Periodically send heartbeats to followers."""
         while True:
             await asyncio.sleep(self._heartbeat_interval)
-            await self._send_heartbeats()
+            try:
+                await self._send_heartbeats()
+            except Exception:
+                pass
 
     async def _send_heartbeats(self) -> None:
         """Send AppendEntries (heartbeats) to all the followers."""
@@ -179,7 +182,7 @@ class RaftNode:
         await asyncio.gather(*[
             _send_to_peer(peer_id, peer_address)
             for peer_id, peer_address in self._peers.items()
-        ])
+        ], return_exceptions=True)
 
     async def _send_request_vote(self, peer_id: str, peer_address: str) -> None:
         """Send RequestVote RPC to a peer."""
