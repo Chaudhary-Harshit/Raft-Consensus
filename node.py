@@ -106,7 +106,7 @@ class RaftNode:
             data = self._serializer.serialize(response)
             await self._transport.send(peer_address, data)
 
-    def _handle_request_vote(self, message: RequestVote) -> None:
+    def _handle_request_vote(self, message: RequestVote) -> RequestVoteResponse:
         """Handle incoming RequestVote RPCs from candidates."""
 
         if message.term < self._persistent_state.current_term:
@@ -220,6 +220,7 @@ class RaftNode:
         else:
             # Follower's log did not match — decrement next_index and retry with earlier entry
             self._leader_state.next_index[message.sender_id] = max(1, self._leader_state.next_index[message.sender_id] - 1)
+            return
 
         # Try to advance Commit index
         for index in range(self._volatile_state.commit_index + 1, len(self._persistent_state.log) + 1):
@@ -353,21 +354,28 @@ class RaftNode:
 
     async def _send_heartbeats(self) -> None:
         """Send AppendEntries (heartbeats) to all the followers."""
+
         async def _send_to_peer(peer_id, peer_address):
-            prev_log_index = self._leader_state.next_index[peer_id] - 1
+            next_index = self._leader_state.next_index[peer_id]
+            prev_log_index = next_index - 1
             prev_log_term = 0
             if prev_log_index > 0:
                 prev_log_term = self._persistent_state.log[prev_log_index - 1].term
+
+            entries = self._persistent_state.log[next_index - 1:]  # Entries to send (could be empty for heartbeat)
+
             append_entries = AppendEntries(
                 term=self._persistent_state.current_term,
                 leader_id=self._node_id,
                 prev_log_index=prev_log_index,
                 prev_log_term=prev_log_term,
-                entries=[],
+                entries=entries,
                 leader_commit=self._volatile_state.commit_index,
             )
             data = self._serializer.serialize(append_entries)
             await self._transport.send(peer_address, data)
+            if entries:
+                self._leader_state.next_index[peer_id] = next_index + len(entries)
         await asyncio.gather(*[
             _send_to_peer(peer_id, peer_address)
             for peer_id, peer_address in self._peers.items()
