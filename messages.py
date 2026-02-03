@@ -20,6 +20,7 @@ class RequestVote:
 class RequestVoteResponse:  # voter's reply
     term: int
     vote_granted: bool
+    sender_id: str
 
 
 @dataclass
@@ -36,6 +37,7 @@ class AppendEntries:
 class AppendEntriesResponse:  # follower's reply
     term: int
     success: bool
+    sender_id: str
 
 
 RaftMessage = Union[RequestVote, RequestVoteResponse, AppendEntries, AppendEntriesResponse]

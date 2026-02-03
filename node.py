@@ -1,6 +1,6 @@
 import asyncio
 import random
-from raft.messages import RequestVote, AppendEntries
+from raft.messages import RequestVote, AppendEntries, RequestVoteResponse, AppendEntriesResponse
 from raft.serializer.base import SerializerBase
 from raft.state import NodeState, PersistentState, VolatileState, LeaderVolatileState
 from raft.storage.base import StorageBase
@@ -77,10 +77,199 @@ class RaftNode:
 
     async def _handle_message(self, sender: str, data: bytes) -> None:
         """Handle incoming messages from other nodes."""
-        pass
+
+        message_object = self._serializer.deserialize(data)
+
+        # Step down if message term is higher than current term meaning that there is a more up-to-date leader/candidate
+        if message_object.term > self._persistent_state.current_term:
+            self._step_down(message_object.term)
+
+        # Dispatch as per the type of message
+        response = None
+
+        if isinstance(message_object, RequestVote):
+            response = self._handle_request_vote(message_object)
+        elif isinstance(message_object, RequestVoteResponse):
+            await self._handle_request_vote_response(message_object)
+        elif isinstance(message_object, AppendEntries):
+            response = self._handle_append_entries(message_object)
+        elif isinstance(message_object, AppendEntriesResponse):
+            self._handle_append_entries_response(message_object)
+
+        # Send response back to the sender if handler returned one
+        if response is not None:
+            if isinstance(message_object, RequestVote):
+                peer_address = self._peers[message_object.candidate_id]
+            elif isinstance(message_object, AppendEntries):
+                peer_address = self._peers[message_object.leader_id]
+
+            data = self._serializer.serialize(response)
+            await self._transport.send(peer_address, data)
+
+    def _handle_request_vote(self, message: RequestVote) -> None:
+        """Handle incoming RequestVote RPCs from candidates."""
+
+        if message.term < self._persistent_state.current_term:
+            return RequestVoteResponse(term=self._persistent_state.current_term, vote_granted=False, sender_id=self._node_id)
+
+        # To grant a vote we need two conditions to be True
+
+        # CONDITION 1: Have not voted for anybody in this term or have already voted for the candidate
+        can_vote = (
+            self._persistent_state.voted_for is None or
+            self._persistent_state.voted_for == message.candidate_id
+        )
+
+        # CONDITION 2: Candidate's log is at least as up-to-date as receiver's log
+        receiver_last_log_term = self._persistent_state.log[-1].term if self._persistent_state.log else 0
+        receiver_last_log_index = len(self._persistent_state.log)
+
+        # If the candidate's log term is greater than receiver's last log term, or if they are equal and candidate's last log index is greater than or equal to receiver's last log index means candidate is more up to date
+        candidate_up_to_date = (
+            message.last_log_term > receiver_last_log_term or
+            (message.last_log_term == receiver_last_log_term and message.last_log_index >= receiver_last_log_index)
+        )
+
+        vote_granted = can_vote and candidate_up_to_date
+        current_term = self._persistent_state.current_term
+        if vote_granted:
+            self._persistent_state.voted_for = message.candidate_id
+            self._storage.save_voted_for(message.candidate_id)
+            self._reset_election_timeout()  # Reset election timeout since we granted a vote
+            return RequestVoteResponse(term=current_term, vote_granted=True, sender_id=self._node_id)
+        else:
+            return RequestVoteResponse(term=current_term, vote_granted=False, sender_id=self._node_id)
+
+    async def _handle_request_vote_response(self, message: RequestVoteResponse) -> None:
+        """Handle incoming RequestVoteResponse RPCs from voters."""
+
+        # Ignore if no longer a candidate
+        if self._node_state != NodeState.CANDIDATE:
+            return
+
+        # Ignore stale response (from old election)
+        if message.term < self._persistent_state.current_term:
+            return
+
+        if message.vote_granted:
+            self._votes_received.add(message.sender_id)
+            if self._has_majority():
+                await self._become_leader()
+
+    def _handle_append_entries(self, message: AppendEntries) -> AppendEntriesResponse:
+        """Handle incoming AppendEntries RPCs from the leader. (heartbeat or log replication)"""
+
+        if message.term < self._persistent_state.current_term:
+            return AppendEntriesResponse(term=self._persistent_state.current_term, success=False, sender_id=self._node_id)
+
+        self._leader_id = message.leader_id
+        self._reset_election_timeout()  # Reset election timeout since we received a heartbeat and leader is alive
+
+        if self._node_state != NodeState.FOLLOWER:
+            self._node_state = NodeState.FOLLOWER
+
+        # Log Consistency Check
+        if message.prev_log_index > 0:
+            # If we do not have an entry at or beyond prev_log_index or the term does not match, we reject the AppendEntries
+            if message.prev_log_index > len(self._persistent_state.log):
+                return AppendEntriesResponse(term=self._persistent_state.current_term, success=False, sender_id=self._node_id)
+            if message.prev_log_term != self._persistent_state.log[message.prev_log_index - 1].term:
+                return AppendEntriesResponse(term=self._persistent_state.current_term, success=False, sender_id=self._node_id)
+
+        # Processing Entries if it is not just a heartbeat (append_entries heartbeat would have empty entries)
+
+        if message.entries:
+            for i, entry in enumerate(message.entries):
+                log_index = message.prev_log_index + 1 + i  # 1-based Raft index for this entry
+                if log_index <= len(self._persistent_state.log):
+                    # Entry exists at this index — check for conflict
+                    if self._persistent_state.log[log_index - 1].term != entry.term:
+                        # Conflict: delete this entry and everything after it, then append remaining new entries
+                        self._persistent_state.log = self._persistent_state.log[:log_index - 1]
+                        self._storage.truncate_log(log_index)
+                        self._persistent_state.log.extend(message.entries[i:])
+                        self._storage.append_entries(message.entries[i:])
+                        break
+                else:
+                    # No existing entry at this index — append all remaining new entries
+                    self._persistent_state.log.extend(message.entries[i:])
+                    self._storage.append_entries(message.entries[i:])
+                    break
+
+        # Update commit index
+        if message.leader_commit > self._volatile_state.commit_index:
+            self._volatile_state.commit_index = min(message.leader_commit, len(self._persistent_state.log))
+
+        return AppendEntriesResponse(term=self._persistent_state.current_term, success=True, sender_id=self._node_id)
+
+    def _handle_append_entries_response(self, message: AppendEntriesResponse) -> None:
+        """Handle incoming AppendEntriesResponse RPCs from followers."""
+
+        # Only leaders handle AppendEntries responses
+        if self._node_state != NodeState.LEADER or not self._leader_state:
+            return
+
+        # Ignore stale response
+        if message.term < self._persistent_state.current_term:
+            return
+
+        if message.success:
+            # Follower's log matched — update match_index and next_index
+            self._leader_state.match_index[message.sender_id] = self._leader_state.next_index[message.sender_id] - 1
+            self._leader_state.next_index[message.sender_id] = self._leader_state.match_index[message.sender_id] + 1
+        else:
+            # Follower's log did not match — decrement next_index and retry with earlier entry
+            self._leader_state.next_index[message.sender_id] = max(1, self._leader_state.next_index[message.sender_id] - 1)
+
+        # Try to advance Commit index
+        for index in range(self._volatile_state.commit_index + 1, len(self._persistent_state.log) + 1):
+            # Count how many nodes have this entry (leader always has it)
+            replicated_count = 1  # counting self
+            for peer_id in self._peers:
+                if self._leader_state.match_index.get(peer_id, 0) >= index:
+                    replicated_count += 1
+
+            # Only commit if a majority have replicated and the log entry is from current term
+            if replicated_count > (len(self._peers) + 1) // 2 and self._persistent_state.log[index - 1].term == self._persistent_state.current_term:
+                self._volatile_state.commit_index = index
+            else:
+                break
+
+    def _step_down(self, term: int) -> None:
+        """Step Down to follower state when the node receives a message with higher term."""
+
+        self._persistent_state.current_term = term
+        self._storage.save_term(self._persistent_state.current_term)
+
+        self._persistent_state.voted_for = None
+        self._storage.save_voted_for(None)
+
+        self._votes_received.clear()
+
+        self._node_state = NodeState.FOLLOWER
+        self._leader_id = None
+
+        if self._heartbeat_interval_task:
+            self._heartbeat_interval_task.cancel()
+            self._heartbeat_interval_task = None
+
+        self._leader_state = None
+        self._reset_election_timeout()
 
     def _reset_election_timeout(self) -> None:
-        """Reset/start the election timeout timer."""
+        """
+        Reset/start the election timeout timer for this node.
+        If a node granted a vote, a candidate must be actively trying to become leader. By resetting the timeout, we are giving that candidate time to win the election and start sending heartbeats — rather than immediately timing out ourself and starting a competing election.
+
+        Without this reset, consider a 5-node cluster:
+        1. Node A starts election, requests votes
+        2. Nodes B, C, D grant votes
+        3. But B, C, D are all close to their own election timeouts
+        4. Before A can win and send heartbeats, B or C times out and starts a new election with a higher term
+        5. This disrupts A's leadership, potentially causing repeated failed elections
+
+        Resetting the timeout reduces unnecessary election churn.
+        """
         if self._election_timeout_task:
             self._election_timeout_task.cancel()
 
