@@ -63,8 +63,7 @@ class TCPTransport(TransportBase):
         try:
             _, writer = await asyncio.open_connection(host, port)
         except Exception as e:
-            print(f"[TCP] CONNECT FAILED to {to}: {e}")
-            raise
+            raise e
         length_prefix = struct.pack(">I", len(message))  # 4-byte big-endian length prefix , so that the receiver knows how many bytes to read
         writer.write(length_prefix)
         writer.write(message)
