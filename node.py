@@ -1,6 +1,9 @@
 import asyncio
+import logging
 import random
-from raft.messages import RequestVote, AppendEntries, RequestVoteResponse, AppendEntriesResponse
+from raft.messages import LogEntry, RequestVote, AppendEntries, RequestVoteResponse, AppendEntriesResponse
+
+logger = logging.getLogger(__name__)
 from raft.serializer.base import SerializerBase
 from raft.state import NodeState, PersistentState, VolatileState, LeaderVolatileState
 from raft.state_machine.base import StateMachineBase
@@ -26,6 +29,10 @@ class RaftNode:
         # Initialize State Machine
         self._state_machine = state_machine
         self._apply_task = None
+
+        # Pending client requests (log index to asyncio.Event)
+        self._pending_requests: dict[int, asyncio.Event] = {}
+        self._apply_results: dict[int, str] = {}  # log_index -> result from state machine
 
         # Node Identity
         self._node_id = node_id
@@ -62,10 +69,12 @@ class RaftNode:
 
     async def start(self, host: str, port: int) -> None:
         """Start the Raft node and begin participating in the cluster."""
+        logger.info(f"[{self._node_id}] Starting node on {host}:{port} with {len(self._peers)} peers")
 
         self._persistent_state.current_term = self._storage.load_term()
         self._persistent_state.voted_for = self._storage.load_voted_for()
         self._persistent_state.log = self._storage.load_log()
+        logger.info(f"[{self._node_id}] Loaded state: term={self._persistent_state.current_term}, log_length={len(self._persistent_state.log)}")
 
         self._apply_task = asyncio.create_task(self._apply_loop())
 
@@ -73,8 +82,10 @@ class RaftNode:
 
         await self._transport.start(host, port)
         self._reset_election_timeout()
+        logger.info(f"[{self._node_id}] Node started successfully")
 
     async def stop(self) -> None:
+        logger.info(f"[{self._node_id}] Stopping node")
         if self._election_timeout_task:
             self._election_timeout_task.cancel()
             self._election_timeout_task = None
@@ -85,11 +96,17 @@ class RaftNode:
             self._apply_task.cancel()
             self._apply_task = None
         await self._transport.stop()
+        logger.info(f"[{self._node_id}] Node stopped")
 
     async def _handle_message(self, sender: str, data: bytes) -> None:
         """Handle incoming messages from other nodes."""
+        try:
+            message_object = self._serializer.deserialize(data)
+        except Exception as e:
+            logger.error(f"[{self._node_id}] Failed to deserialize message from {sender}: {e}")
+            return
 
-        message_object = self._serializer.deserialize(data)
+        logger.debug(f"[{self._node_id}] Received {type(message_object).__name__} from {sender} (term={message_object.term})")
 
         # Step down if message term is higher than current term meaning that there is a more up-to-date leader/candidate
         if message_object.term > self._persistent_state.current_term:
@@ -98,24 +115,33 @@ class RaftNode:
         # Dispatch as per the type of message
         response = None
 
-        if isinstance(message_object, RequestVote):
-            response = self._handle_request_vote(message_object)
-        elif isinstance(message_object, RequestVoteResponse):
-            await self._handle_request_vote_response(message_object)
-        elif isinstance(message_object, AppendEntries):
-            response = self._handle_append_entries(message_object)
-        elif isinstance(message_object, AppendEntriesResponse):
-            self._handle_append_entries_response(message_object)
+        try:
+            if isinstance(message_object, RequestVote):
+                response = self._handle_request_vote(message_object)
+            elif isinstance(message_object, RequestVoteResponse):
+                await self._handle_request_vote_response(message_object)
+            elif isinstance(message_object, AppendEntries):
+                response = self._handle_append_entries(message_object)
+            elif isinstance(message_object, AppendEntriesResponse):
+                self._handle_append_entries_response(message_object)
+        except Exception as e:
+            logger.error(f"[{self._node_id}] Error handling {type(message_object).__name__}: {e}")
+            return
 
         # Send response back to the sender if handler returned one
         if response is not None:
-            if isinstance(message_object, RequestVote):
-                peer_address = self._peers[message_object.candidate_id]
-            elif isinstance(message_object, AppendEntries):
-                peer_address = self._peers[message_object.leader_id]
+            try:
+                if isinstance(message_object, RequestVote):
+                    peer_address = self._peers[message_object.candidate_id]
+                elif isinstance(message_object, AppendEntries):
+                    peer_address = self._peers[message_object.leader_id]
 
-            data = self._serializer.serialize(response)
-            await self._transport.send(peer_address, data)
+                data = self._serializer.serialize(response)
+                await self._transport.send(peer_address, data)
+            except KeyError as e:
+                logger.error(f"[{self._node_id}] Unknown peer in response routing: {e}")
+            except Exception as e:
+                logger.error(f"[{self._node_id}] Failed to send response: {e}")
 
     def _handle_request_vote(self, message: RequestVote) -> RequestVoteResponse:
         """Handle incoming RequestVote RPCs from candidates."""
@@ -147,8 +173,10 @@ class RaftNode:
             self._persistent_state.voted_for = message.candidate_id
             self._storage.save_voted_for(message.candidate_id)
             self._reset_election_timeout()  # Reset election timeout since we granted a vote
+            logger.info(f"[{self._node_id}] Granted vote to {message.candidate_id} for term {current_term}")
             return RequestVoteResponse(term=current_term, vote_granted=True, sender_id=self._node_id)
         else:
+            logger.debug(f"[{self._node_id}] Denied vote to {message.candidate_id} for term {message.term} (can_vote={can_vote}, up_to_date={candidate_up_to_date})")
             return RequestVoteResponse(term=current_term, vote_granted=False, sender_id=self._node_id)
 
     async def _handle_request_vote_response(self, message: RequestVoteResponse) -> None:
@@ -164,6 +192,7 @@ class RaftNode:
 
         if message.vote_granted:
             self._votes_received.add(message.sender_id)
+            logger.debug(f"[{self._node_id}] Received vote from {message.sender_id} ({len(self._votes_received)}/{len(self._peers) + 1})")
             if self._has_majority():
                 await self._become_leader()
 
@@ -228,9 +257,11 @@ class RaftNode:
             # Follower's log matched — update match_index and next_index
             self._leader_state.match_index[message.sender_id] = self._leader_state.next_index[message.sender_id] - 1
             self._leader_state.next_index[message.sender_id] = self._leader_state.match_index[message.sender_id] + 1
+            logger.debug(f"[{self._node_id}] AppendEntries success from {message.sender_id}: match_index={self._leader_state.match_index[message.sender_id]}")
         else:
             # Follower's log did not match — decrement next_index and retry with earlier entry
             self._leader_state.next_index[message.sender_id] = max(1, self._leader_state.next_index[message.sender_id] - 1)
+            logger.debug(f"[{self._node_id}] AppendEntries rejected by {message.sender_id}, next_index decremented to {self._leader_state.next_index[message.sender_id]}")
             return
 
         # Try to advance Commit index
@@ -244,11 +275,13 @@ class RaftNode:
             # Only commit if a majority have replicated and the log entry is from current term
             if replicated_count > (len(self._peers) + 1) // 2 and self._persistent_state.log[index - 1].term == self._persistent_state.current_term:
                 self._volatile_state.commit_index = index
+                logger.info(f"[{self._node_id}] Advanced commit_index to {index}")
             else:
                 break
 
     def _step_down(self, term: int) -> None:
         """Step Down to follower state when the node receives a message with higher term."""
+        logger.info(f"[{self._node_id}] Stepping down to follower (term {self._persistent_state.current_term} -> {term})")
 
         self._persistent_state.current_term = term
         self._storage.save_term(self._persistent_state.current_term)
@@ -303,6 +336,7 @@ class RaftNode:
 
         # Increment the current term and save it to persistent storage
         self._persistent_state.current_term += 1
+        logger.info(f"[{self._node_id}] Starting election for term {self._persistent_state.current_term}")
         self._storage.save_term(self._persistent_state.current_term)
 
         # Vote for self and save to persistent storage
@@ -335,6 +369,7 @@ class RaftNode:
         # Change the state to leader
         self._node_state = NodeState.LEADER
         self._leader_id = self._node_id
+        logger.info(f"[{self._node_id}] Became LEADER for term {self._persistent_state.current_term}")
 
         # Cancel election timeout task as we are now the leader
         if self._election_timeout_task:
@@ -360,8 +395,8 @@ class RaftNode:
             await asyncio.sleep(self._heartbeat_interval)
             try:
                 await self._send_heartbeats()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[{self._node_id}] Heartbeat cycle failed: {e}")
 
     async def _send_heartbeats(self) -> None:
         """Send AppendEntries (heartbeats) to all the followers."""
@@ -383,10 +418,13 @@ class RaftNode:
                 entries=entries,
                 leader_commit=self._volatile_state.commit_index,
             )
-            data = self._serializer.serialize(append_entries)
-            await self._transport.send(peer_address, data)
-            if entries:
-                self._leader_state.next_index[peer_id] = next_index + len(entries)
+            try:
+                data = self._serializer.serialize(append_entries)
+                await self._transport.send(peer_address, data)
+                if entries:
+                    self._leader_state.next_index[peer_id] = next_index + len(entries)
+            except Exception as e:
+                logger.warning(f"[{self._node_id}] Failed to send AppendEntries to {peer_id}: {e}")
         await asyncio.gather(*[
             _send_to_peer(peer_id, peer_address)
             for peer_id, peer_address in self._peers.items()
@@ -405,8 +443,11 @@ class RaftNode:
             last_log_index=last_log_index,
             last_log_term=last_log_term,
         )
-        data = self._serializer.serialize(request)
-        await self._transport.send(peer_address, data)
+        try:
+            data = self._serializer.serialize(request)
+            await self._transport.send(peer_address, data)
+        except Exception as e:
+            logger.warning(f"[{self._node_id}] Failed to send RequestVote to {peer_id}: {e}")
 
     # A background async task that watches for committed but unapplied entries
     async def _apply_loop(self) -> None:
@@ -416,6 +457,41 @@ class RaftNode:
                 self._volatile_state.last_applied += 1
                 entry = self._persistent_state.log[self._volatile_state.last_applied - 1]
                 # Apply the command to the state machine
-                self._state_machine.apply(entry.command)
+                try:
+                    result = self._state_machine.apply(entry.command)
+                except Exception as e:
+                    logger.error(f"[{self._node_id}] State machine failed to apply command '{entry.command}' at index {self._volatile_state.last_applied}: {e}")
+                    result = f"ERROR: {e}"
+                logger.debug(f"[{self._node_id}] Applied entry at index {self._volatile_state.last_applied}: {entry.command} -> {result}")
+                self._apply_results[self._volatile_state.last_applied] = result
+                event = self._pending_requests.pop(self._volatile_state.last_applied, None)
+                if event:
+                    event.set()  # Unblocks/Signals the user waiting for this command to be applied
             else:
-                await asyncio.sleep(0.01)  # Sleep briefly to avoid busy waiting (pause 10ms, let other tasks runa)
+                await asyncio.sleep(0.01)  # Sleep briefly to avoid busy waiting (pause 10ms, let other tasks run)
+
+    async def submit_command(self, command: str) -> tuple[bool, str]:
+        """Submit a command to the Raft cluster. Only the leader can accept commands."""
+
+        if self._node_state != NodeState.LEADER:
+            logger.warning(f"[{self._node_id}] Command rejected: not leader (leader={self._leader_id})")
+            return (False, self._leader_id or "unknown")
+
+        entry = LogEntry(term=self._persistent_state.current_term, command=command)
+        self._persistent_state.log.append(entry)
+        self._storage.append_entries([entry])
+
+        entry_index = len(self._persistent_state.log)  # 1-based index
+
+        event = asyncio.Event()
+        self._pending_requests[entry_index] = event
+        logger.info(f"[{self._node_id}] Command submitted at index {entry_index}: {command}")
+        try:
+            await asyncio.wait_for(event.wait(), timeout=5.0)  # Wait up to 5 seconds for commitment
+            result = self._apply_results.pop(entry_index, "OK")
+            logger.info(f"[{self._node_id}] Command committed at index {entry_index}: {result}")
+            return (True, result)
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(entry_index, None)
+            logger.warning(f"[{self._node_id}] Command timed out at index {entry_index}: {command}")
+            return (False, "Not Committed")
