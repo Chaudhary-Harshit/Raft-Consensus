@@ -3,6 +3,7 @@ import random
 from raft.messages import RequestVote, AppendEntries, RequestVoteResponse, AppendEntriesResponse
 from raft.serializer.base import SerializerBase
 from raft.state import NodeState, PersistentState, VolatileState, LeaderVolatileState
+from raft.state_machine.base import StateMachineBase
 from raft.storage.base import StorageBase
 from raft.transport.base import TransportBase
 
@@ -17,10 +18,15 @@ class RaftNode:
         transport: TransportBase,
         storage: StorageBase,
         serializer: SerializerBase,
+        state_machine: StateMachineBase,
         election_timeout_min: float = 0.150,
         election_timeout_max: float = 0.300,
         heartbeat_interval: float = 0.050,
     ):
+        # Initialize State Machine
+        self._state_machine = state_machine
+        self._apply_task = None
+
         # Node Identity
         self._node_id = node_id
         self._peers = peers  # mapping of node_id to address
@@ -61,6 +67,8 @@ class RaftNode:
         self._persistent_state.voted_for = self._storage.load_voted_for()
         self._persistent_state.log = self._storage.load_log()
 
+        self._apply_task = asyncio.create_task(self._apply_loop())
+
         self._transport.register_handler(self._handle_message)
 
         await self._transport.start(host, port)
@@ -73,6 +81,9 @@ class RaftNode:
         if self._heartbeat_interval_task:
             self._heartbeat_interval_task.cancel()
             self._heartbeat_interval_task = None
+        if self._apply_task:
+            self._apply_task.cancel()
+            self._apply_task = None
         await self._transport.stop()
 
     async def _handle_message(self, sender: str, data: bytes) -> None:
@@ -396,3 +407,15 @@ class RaftNode:
         )
         data = self._serializer.serialize(request)
         await self._transport.send(peer_address, data)
+
+    # A background async task that watches for committed but unapplied entries
+    async def _apply_loop(self) -> None:
+        """Apply committed log entries to the state machine."""
+        while True:
+            if self._volatile_state.last_applied < self._volatile_state.commit_index:
+                self._volatile_state.last_applied += 1
+                entry = self._persistent_state.log[self._volatile_state.last_applied - 1]
+                # Apply the command to the state machine
+                self._state_machine.apply(entry.command)
+            else:
+                await asyncio.sleep(0.01)  # Sleep briefly to avoid busy waiting (pause 10ms, let other tasks runa)
