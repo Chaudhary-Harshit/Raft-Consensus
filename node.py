@@ -3,12 +3,13 @@ import logging
 import random
 from raft.messages import LogEntry, RequestVote, AppendEntries, RequestVoteResponse, AppendEntriesResponse
 
-logger = logging.getLogger(__name__)
 from raft.serializer.base import SerializerBase
 from raft.state import NodeState, PersistentState, VolatileState, LeaderVolatileState
 from raft.state_machine.base import StateMachineBase
 from raft.storage.base import StorageBase
 from raft.transport.base import TransportBase
+
+logger = logging.getLogger(__name__)
 
 
 class RaftNode:
