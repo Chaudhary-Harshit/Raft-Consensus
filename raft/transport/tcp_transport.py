@@ -1,7 +1,10 @@
 import asyncio
+import logging
 import struct
 from raft.transport.base import TransportBase
 from typing import Awaitable, Callable
+
+logger = logging.getLogger(__name__)
 
 
 class TCPTransport(TransportBase):
@@ -36,10 +39,13 @@ class TCPTransport(TransportBase):
             message_length = struct.unpack(">I", length_prefix)[0]  # unpack the length prefix to get the message length (as unpackr returns a tuple, we take the first element)
 
             message = await reader.readexactly(message_length)  # read the actual message based on the length
+            logger.debug(f"Received {message_length} bytes from {sender_address}")
             if self._handler:
                 await self._handler(sender_address, message)
         except asyncio.IncompleteReadError:
-            pass
+            logger.warning(f"Incomplete read from {sender_address}")
+        except Exception as e:
+            logger.error(f"Error handling connection from {sender_address}: {e}")
         finally:
             writer.close()
             await writer.wait_closed()
@@ -54,7 +60,11 @@ class TCPTransport(TransportBase):
     async def send(self, to: str, message: bytes) -> None:
         host, port_str = to.rsplit(":", 1)
         port = int(port_str)
-        _, writer = await asyncio.open_connection(host, port)
+        try:
+            _, writer = await asyncio.open_connection(host, port)
+        except Exception as e:
+            print(f"[TCP] CONNECT FAILED to {to}: {e}")
+            raise
         length_prefix = struct.pack(">I", len(message))  # 4-byte big-endian length prefix , so that the receiver knows how many bytes to read
         writer.write(length_prefix)
         writer.write(message)

@@ -316,7 +316,7 @@ class RaftNode:
 
         Resetting the timeout reduces unnecessary election churn.
         """
-        if self._election_timeout_task:
+        if self._election_timeout_task and self._election_timeout_task is not asyncio.current_task():  # Avoid cancelling self if called from within the election timeout handler
             self._election_timeout_task.cancel()
 
         timeout = random.uniform(self._election_timeout_min, self._election_timeout_max)
