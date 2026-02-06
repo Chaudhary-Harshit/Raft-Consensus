@@ -25,7 +25,7 @@ Raft is a consensus algorithm that allows a cluster of nodes to agree on a seque
 cd raft_consensus
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[test]"
+pip install -e .
 ```
 
 ## Running the Cluster
